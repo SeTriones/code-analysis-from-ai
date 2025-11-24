@@ -129,6 +129,49 @@ This is a critical performance step in SGLangs implementation.
     *   **Complex Case (Page Size > 1 & TopK > 1):** Rejected tokens might leave "holes" inside KV pages. SGLang uses `move_kv_cache` to compact the accepted tokens into contiguous pages before freeing the fragmented ones.
 4.  **Next Draft Prep:** The hidden states of the *accepted* tokens are preserved to serve as the input for the next draft phase.
 
+
+---
+
+## Draft Batch Handling: Idle vs. Decode
+
+### Function of `_draft_preprocess_idle`
+
+The function `_draft_preprocess_idle` is a helper method used to prepare the batch state when the speculative worker is in an **IDLE** mode (i.e., not actively drafting tokens for verification).
+
+Its specific actions are:
+1.  **Creates Empty Input**: It initializes `batch.spec_info` with an empty `EagleDraftInput` object using `EagleDraftInput.create_idle_input`.
+    *   This object contains zero-sized tensors for `verified_id`, `hidden_states`, `topk_p`, etc.
+2.  **Prevents Computation**: By setting these empty structures, it ensures that the subsequent `draft_forward` loop operates on empty data (effectively a no-op), avoiding unnecessary memory allocation or kernel launches for the draft model.
+
+```python
+def _draft_preprocess_idle(self, batch: ScheduleBatch):
+    batch.spec_info = EagleDraftInput.create_idle_input(
+        device=self.device,
+        hidden_size=self.model_config.hidden_size,
+        dtype=self.model_config.dtype,
+        topk=self.topk,
+        capture_hidden_mode=CaptureHiddenMode.LAST,
+    )
+```
+
+### Difference: Idle Draft Batch vs. Decode Draft Batch
+
+The distinction lies in whether the worker intends to generate a speculative token tree or just pass through (e.g., for synchronization or empty steps).
+
+| Feature | **Decode Draft Batch** (`_draft_preprocess_decode`) | **Idle Draft Batch** (`_draft_preprocess_idle`) |
+| :--- | :--- | :--- |
+| **Purpose** | Active speculative generation. The draft model will run for $N$ steps to propose candidate tokens. | No-op / Passthrough. The draft model does not generate tokens. |
+| **Memory Allocation** | **Allocates KV Cache.** It calls `alloc_token_slots` (or paged variants) to reserve GPU memory for the new candidate tokens that will be generated. | **None.** No new KV cache slots are allocated. |
+| **Input State** | Uses valid hidden states and token IDs from the previous verification step (or prefill) to seed the generation. | Uses empty (size 0) tensors for hidden states and IDs. |
+| **Batch Mode** | `ForwardMode.DECODE` | `ForwardMode.IDLE` |
+| **Outcome** | Produces a `SpecInput` with a tree of candidates to be verified by the target model. | Produces an empty `SpecInput`. The subsequent `verify` step will also simply return an empty result without running the target model. |
+
+**When is IDLE used?**
+An **IDLE** batch typically occurs in scenarios like:
+1.  **Data Parallel Attention (DP Attention)**: If a specific worker in a DP group has no requests to process in the current step but needs to stay synchronized with the group.
+2.  **Empty Batches**: If the scheduler sends a batch with no active requests for the speculative worker.
+3.  **Initialization/Reset**: When transitioning states where no valid history exists to draft from immediately (though prefill usually handles the setup).
+
 ## Key Code Files
 
 ### Python Runtime (`python/sglang/srt/speculative/`)
