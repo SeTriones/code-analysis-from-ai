@@ -247,3 +247,100 @@ The model loading process is orchestrated by the `SRT` (SGLang Runtime) engine. 
 *   **`BaseModelLoader.load_model()`** (`python/sglang/srt/model_loader/loader.py`): The abstract method implemented by specific loaders.
     *   **`DefaultModelLoader.load_model`**: Loads weights from HF/disk (safetensors, bin, pt).
     *   **`_prepare_weights`**: Handles downloading from HF/ModelScope and identifying weight files.
+
+# KV Cache Organization
+
+SGLang supports a variety of KV cache types, optimized for different backends and hardware. The organization involves a two-level memory pool system: `ReqToTokenPool` maps requests to token locations, and `TokenToKVPoolAllocator` manages the indices to the KV cache data, while `KVCache` and its subclasses hold the actual physical KV cache tensors.
+
+## 1. MHA KV Cache (`MHATokenToKVPool`)
+*   **Supported:** Yes, this is the standard Multi-Head Attention KV cache.
+*   **Allocation Process:**
+    *   **Function `alloc` (in `ReqToTokenPool`, `python/sglang/srt/mem_cache/memory_pool.py`):** Allocates a new slot for a request from `free_slots`.
+    *   **Function `alloc` (in `TokenToKVPoolAllocator`, `python/sglang/srt/mem_cache/allocator.py`):** Allocates physical token slots from `free_pages`.
+    *   **Function `set_kv_buffer` (in `MHATokenToKVPool`, `python/sglang/srt/mem_cache/memory_pool.py`):** Writes the Key and Value tensors into the allocated buffer slots.
+*   **Free Process:**
+    *   **Function `free` (in `ReqToTokenPool`, `python/sglang/srt/mem_cache/memory_pool.py`):** Returns the request slot to `free_slots`.
+    *   **Function `free` (in `TokenToKVPoolAllocator`, `python/sglang/srt/mem_cache/allocator.py`):** Returns the physical token slots to `free_pages` (or `release_pages`).
+*   **Important Data Structures:**
+    *   `k_buffer` (`python/sglang/srt/mem_cache/memory_pool.py`): Tensor storing keys, shape `[size, head_num, head_dim]` per layer.
+    *   `v_buffer` (`python/sglang/srt/mem_cache/memory_pool.py`): Tensor storing values, shape `[size, head_num, head_dim]` per layer.
+    *   `req_to_token` (`python/sglang/srt/mem_cache/memory_pool.py`): Maps request IDs to token indices.
+
+## 2. MLA KV Cache (`MLATokenToKVPool`)
+*   **Supported:** Yes, for Multi-Head Latent Attention (e.g., DeepSeek-V2/V3).
+*   **Allocation Process:**
+    *   Same allocation logic (`alloc`) as MHA.
+    *   **Function `set_mla_kv_buffer` (in `MLATokenToKVPool`, `python/sglang/srt/mem_cache/memory_pool.py`):** Writes the compressed latent vector (`cache_k_nope`) and the rotary embedding part (`cache_k_rope`) into the buffer.
+*   **Free Process:**
+    *   Same free logic (`free`) as MHA.
+*   **Important Data Structures:**
+    *   `kv_buffer` (`python/sglang/srt/mem_cache/memory_pool.py`): Stores the compressed latent vector and rotary part.
+    *   `kv_scale_buffer` (`python/sglang/srt/mem_cache/memory_pool.py`): (Optional) Stores quantization scales if FP8 is used.
+
+## 3. Hybrid Linear KV Cache (`HybridLinearKVPool`)
+*   **Supported:** Yes, for hybrid models like Jamba (Mamba + Attention).
+*   **Allocation Process:**
+    *   **Function `alloc` (in `HybridReqToTokenPool`, `python/sglang/srt/mem_cache/memory_pool.py`):** Allocates token slots for attention layers *and* a Mamba state slot (`mamba_pool.alloc`).
+*   **Free Process:**
+    *   **Function `free` (in `HybridReqToTokenPool`, `python/sglang/srt/mem_cache/memory_pool.py`):** Frees both the attention token slots and the Mamba state slot.
+*   **Important Data Structures:**
+    *   `full_kv_pool` (`python/sglang/srt/mem_cache/memory_pool.py`): An instance of `MHATokenToKVPool` or `MLATokenToKVPool` for the attention layers.
+    *   `mamba_pool` (`python/sglang/srt/mem_cache/memory_pool.py`): An instance of `MambaPool` storing Mamba states (`conv_state`, `temporal_state`).
+
+## 4. SWA KV Cache (`SWAKVPool`)
+*   **Supported:** Yes, for Sliding Window Attention models mixed with full attention (e.g., Gemma 2).
+*   **Allocation Process:**
+    *   **Function `alloc` (in `SWATokenToKVPoolAllocator`, `python/sglang/srt/mem_cache/allocator.py`):** Allocates slots in *both* `full_kv_pool` and `swa_kv_pool`.
+    *   Maintains a mapping `full_to_swa_index_mapping`.
+*   **Free Process:**
+    *   **Function `free` (in `SWATokenToKVPoolAllocator`, `python/sglang/srt/mem_cache/allocator.py`):** Frees slots in both pools.
+*   **Important Data Structures:**
+    *   `full_kv_pool` (`python/sglang/srt/mem_cache/memory_pool.py`): Stores KV cache for global/full attention layers.
+    *   `swa_kv_pool` (`python/sglang/srt/mem_cache/memory_pool.py`): Stores KV cache for sliding window attention layers.
+
+## 5. Ascend MHA KV Cache (`AscendTokenToKVPool`)
+*   **Supported:** Yes, optimized for Huawei Ascend NPUs.
+*   **Allocation Process:**
+    *   Similar to `MHATokenToKVPool` but uses `torch_npu._npu_reshape_and_cache` in `set_kv_buffer` (`python/sglang/srt/mem_cache/memory_pool.py`).
+*   **Free Process:**
+    *   Same as `MHATokenToKVPool`.
+*   **Important Data Structures:**
+    *   `kv_buffer` (`python/sglang/srt/mem_cache/memory_pool.py`): A unified tensor storing both K and V to optimize NPU transmission.
+
+## 6. Ascend MLA Paged KV Cache (`AscendMLAPagedTokenToKVPool`)
+*   **Supported:** Yes, for DeepSeek models on Ascend NPUs.
+*   **Allocation Process:**
+    *   Uses `torch_npu.npu_scatter_nd_update_` for updating buffers in `set_kv_buffer` (`python/sglang/srt/mem_cache/memory_pool.py`).
+*   **Important Data Structures:**
+    *   `k_buffer`, `v_buffer`, `index_k_buffer` (`python/sglang/srt/mem_cache/memory_pool.py`).
+
+## 7. NSA KV Cache (`NSATokenToKVPool`)
+*   **Supported:** Yes, for Native Sparse Attention.
+*   **Allocation Process:**
+    *   Allocates `index_k_with_scale_buffer` for hierarchical indexing in `__init__` (`python/sglang/srt/mem_cache/memory_pool.py`).
+*   **Important Data Structures:**
+    *   `index_k_with_scale_buffer` (`python/sglang/srt/mem_cache/memory_pool.py`): Stores compressed keys and scales for the top-level index.
+
+## 8. Double Sparse KV Cache (`DoubleSparseTokenToKVPool`)
+*   **Supported:** Yes, presumably for models with heavy-hitter sparsity.
+*   **Allocation/Free Process:** Standard token allocation.
+*   **Important Data Structures:**
+    *   `label_buffer` (`python/sglang/srt/mem_cache/memory_pool.py`): Stores heavy-hitter labels/indices alongside `k_buffer` and `v_buffer`.
+
+## 9. Mamba Pool (`MambaPool`)
+*   **Supported:** Yes, for storing SSM states.
+*   **Allocation Process:**
+    *   **Function `alloc` (in `MambaPool`, `python/sglang/srt/mem_cache/memory_pool.py`):** Allocates a state slot from `free_slots`.
+*   **Free Process:**
+    *   **Function `free` (in `MambaPool`, `python/sglang/srt/mem_cache/memory_pool.py`):** Zeros out the state tensors and returns indices to `free_slots`.
+*   **Important Data Structures:**
+    *   `conv_state` (`python/sglang/srt/mem_cache/memory_pool.py`): Stores convolution states.
+    *   `temporal_state` (`python/sglang/srt/mem_cache/memory_pool.py`): Stores SSM states.
+
+## 10. Paged Token Allocator (`PagedTokenToKVPoolAllocator`)
+*   **Supported:** Yes, used for page-aligned memory management.
+*   **Allocation Process:**
+    *   **Function `alloc_extend` (in `PagedTokenToKVPoolAllocator`, `python/sglang/srt/mem_cache/allocator.py`):** Uses a Triton kernel `alloc_extend_kernel` to allocate contiguous pages for new tokens.
+    *   **Function `alloc_decode` (in `PagedTokenToKVPoolAllocator`, `python/sglang/srt/mem_cache/allocator.py`):** Uses a Triton kernel `alloc_decode_kernel` to allocate the next token slot.
+*   **Important Data Structures:**
+    *   `free_pages` (`python/sglang/srt/mem_cache/allocator.py`): List of available page indices.
