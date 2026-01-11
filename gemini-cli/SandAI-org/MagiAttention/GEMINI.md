@@ -93,4 +93,9 @@ make coverage
 *   `calc_attn`: Main function for distributed attention computation.
 *   `dispatch`: Dispatches data for context parallelism.
 *   `flex_flash_attn_func`: Direct interface to the Flexible Flash Attention kernel.
-*   `undispatch`: Gathers data back after attention.
+*   `undispatch`: Gathers data back after attention
+
+## Implementation details
+
+Implementation details are stored in arch.md file for furthur reference.
+
