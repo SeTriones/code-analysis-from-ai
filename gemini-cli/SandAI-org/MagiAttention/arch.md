@@ -134,6 +134,45 @@ The transformation of data follows this path:
 *   **`TransferTable`**: A `[CP_SIZE x CP_SIZE]` table mapping global ranges to local send/recv buffer offsets.
 *   **`GroupCastRanges`**: A specialized range collection that handles overlapping requirements from multiple ranks, splitting them into non-overlapping segments for efficient `GroupCast` communication.
 
+## Detailed Analysis of OverlapSolver
+
+The `OverlapSolver` is a specialized component responsible for minimizing total execution time by optimizing the scheduling of communication and computation chunks.
+
+### 1. Objective
+Its primary goal is to solve the **Multi-Stage Overlapping Problem**: Given a set of work "chunks" (each with a communication cost and a calculation cost), how should they be grouped into "stages" and ordered to maximize the overlap between:
+*   **Communication**: Fetching data for the *current* stage (`Stage i`).
+*   **Calculation**: Processing data for the *previous* stage (`Stage i-1`).
+
+### 2. Algorithms
+Currently, the solver implements a **Uniform** strategy (with a placeholder for a future **Greedy** strategy).
+
+*   **Uniform Overlap (`_solve_with_uniform`)**:
+    *   **Logic**: It partitions the available chunks into `overlap_degree` stages as evenly as possible.
+    *   **Host Pinning**: The host chunk (index 0) is always pinned to the first stage (`Stage 0`) because it is immediately available for computation.
+    *   **Randomization**: If enabled, it shuffles the remote chunks to potentially find a better random distribution, which can be useful for avoiding "hotspots" in communication patterns.
+    *   **Idle Stages**: If the requested degree is higher than the number of chunks, it appends empty "idle" stages to satisfy the architectural requirement.
+
+### 3. Cost Model
+The solver uses a simplified pipeline simulation to estimate the `overall_cost` (total time).
+
+**Formula**:
+`Total Time = Stage_0_Cost + Σ (Stage_i_Cost) + Final_Calc`
+
+Where the cost of each overlapped step is:
+`Stage_i_Cost = max(Comm_i, Calc_{i-1})`
+
+*   **`Comm_i`**: Time to fetch all chunks in Stage `i`.
+*   **`Calc_{i-1}`**: Time to compute attention for all chunks in Stage `i-1`.
+*   **Assumption**: It assumes perfect concurrency—computation and communication happen simultaneously. The pipeline is limited by whichever operation takes longer (the "bottleneck").
+
+### 4. Dynamic vs. Static Mode
+*   **Static Mode**: Uses a fixed `overlap_degree` defined by the user (e.g., 2 or 3). The solver simply partitions chunks into that many stages.
+*   **Dynamic Mode**: The solver performs a search to find the optimal degree.
+    1.  It iterates from `degree=1` to `dynamic_max_degree`.
+    2.  For each degree, it generates a solution and calculates the `overall_cost`.
+    3.  It selects the **Best Solution** by minimizing total cost (primary) and overlap degree (secondary).
+    4.  **Global Sync**: In a distributed setting, all ranks must agree on the number of stages. The `DistAttnSolver` performs an `all_reduce(MAX)` to synchronize the final `overlap_degree` across the cluster.
+
 ---
 
 ## Internal Calling Process
