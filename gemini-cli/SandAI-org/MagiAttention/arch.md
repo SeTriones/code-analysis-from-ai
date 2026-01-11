@@ -103,28 +103,36 @@ The attention function (e.g., `magi_attention_func`) receives `q`, `k`, and `v` 
 ### The Role of `calc_attn`
 While `calc_attn` receives local shards, it is responsible for fetching the required **remote** K/V slices from other ranks (as planned by the `DistAttnSolver`) to ensure that every query in the local shard can attend to its full context across the entire distributed system.
 
-## The DistAttnSolver
+## Detailed Analysis of DistAttnSolver
 
-The `DistAttnSolver` is the core "strategist" of MagiAttention. It acts as a compiler that transforms a logical attention mask into an optimized physical execution plan.
+The `DistAttnSolver` is a sophisticated component responsible for partitioning attention computation and communication across multiple ranks to maximize overlap. It transforms a logical mask into a physical execution plan.
 
-### Internal Workflow
+### 1. State Initialization
+*   **`__init__`**: Initializes the distributed environment (rank, size, group) and the `OverlapSolver`. It sets up the `OverlapConfig`, which defines cost factors and constraints on chunking (e.g., `min_chunk_size`, `max_num_chunks`).
+*   **`solve`**: The main execution flow. It identifies the local attention bucket, determines global host/remote K ranges, and then proceeds through a multi-step process: chunking remote K ranges, solving the overlap problem, and constructing a detailed communication plan (`TransferTable`).
 
-1.  **Dependency Identification**:
-    *   **Host vs. Remote**: It analyzes the local `q_ranges` and identifies which required `k_ranges` are already resident on the current GPU (**Host**) and which must be fetched from other GPUs (**Remote**).
-    *   **Hole Calculation**: It identifies "holes" in the required data—specific token ranges that are missing locally and must be scheduled for communication.
+### 2. Core Algorithms
+*   **Chunking (`_chunk_remote_k_ranges_global`)**: Determines how to split the remote K sequence. It attempts to use `min_chunk_size` but caps the total number of chunks at `max_num_chunks`. If the cap is hit, it increases the chunk size dynamically.
+*   **Cost Estimation (`_calc_cost_pairs_per_chunk`)**: Estimates execution costs for the host chunk and each remote chunk:
+    *   `calc_cost = calc_cost_factor * attention_area` (where area is Q_len * K_len).
+    *   `comm_cost = comm_cost_factor * sequence_length`.
+    *   The host chunk has a communication cost of 0.
+*   **Overlap Solving (`_solve_multi_stage_overlap`)**: Uses the `OverlapSolver` to group chunks into stages to minimize total execution time. In `DYNAMIC` mode, it synchronizes the `overlap_degree` across all ranks using a global maximum to ensure consistent scheduling.
+*   **Rank Entry Construction (`_calc_remote_rank_entry_for_one_stage`)**: Merges the chunks assigned to a specific stage into a single `RemoteRankEntry`. It handles complex logic for slice splitting and mask merging (e.g., merging FULL and CAUSAL masks when chunks are combined).
+*   **Communication Planning (`_init_transfer_table_per_stage`)**: Constructs the `TransferTable` for each stage. It identifies precisely which global K ranges need to be sent to or received from other ranks and calculates their local offsets in the communication buffers.
 
-2.  **Overlap Planning (`OverlapSolver`)**:
-    *   **Cost Estimation**: Estimates the execution time for both communication (fetching remote blocks) and computation (running the FFA kernel) based on sequence lengths and mask sparsity.
-    *   **Multi-Stage Scheduling**: It divides the attention computation into multiple **overlap stages**. The goal is to perfectly overlap communication and computation: while the GPU processes "Stage N," the network asynchronously fetches the data required for "Stage N+1."
-    *   **Dynamic vs. Static**: Supports both static overlap (fixed degree) and dynamic overlap (automatically adjusting the number of stages to maximize hardware utilization).
+### 3. Data Flow
+The transformation of data follows this path:
+1.  **`HostRankEntry`**: Captures the initial global state (local Q/K ranges) and the fine-grained list of all remote chunks needed by the rank.
+2.  **`RemoteRankEntry`**: Represents the aggregated work (computation + required remote data) for a specific *overlap stage*.
+3.  **`TransferTable`**: A detailed 2D plan of rank-to-rank data transfers for a stage, mapping global ranges to local send/recv buffer offsets.
+4.  **`CommMeta` / `CalcMeta`**: The final runtime arguments. `CommMeta` provides the `GroupCollectiveArg` for communication primitives, and `CalcMeta` provides the `AttnArg` for the GPU kernels.
 
-3.  **Transfer Table Construction**:
-    *   It generates a precise **Transfer Table** for every rank pair `(Sender, Receiver)`.
-    *   This table acts as a shipping manifest, detailing exactly which token ranges must be sent and received during each overlap stage, ensuring zero-redundant communication.
-
-4.  **Meta Generation**:
-    *   **CommMeta**: Defines the arguments for communication primitives (e.g., `GroupCast`). It specifies input/output split sizes and destination/source indices for every rank.
-    *   **CalcMeta**: Defines the arguments for the attention kernels (FFA). It maps the local and newly received K/V blocks to their corresponding Q blocks for computation.
+### 4. Key Classes
+*   **`HostRankEntry`**: Container for global ranges and the list of all remote chunks.
+*   **`RemoteRankEntry`**: Container for a single stage's remote K ranges and corresponding attention slices.
+*   **`TransferTable`**: A `[CP_SIZE x CP_SIZE]` table mapping global ranges to local send/recv buffer offsets.
+*   **`GroupCastRanges`**: A specialized range collection that handles overlapping requirements from multiple ranks, splitting them into non-overlapping segments for efficient `GroupCast` communication.
 
 ---
 
