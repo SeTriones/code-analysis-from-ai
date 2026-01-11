@@ -173,6 +173,58 @@ Where the cost of each overlapped step is:
     3.  It selects the **Best Solution** by minimizing total cost (primary) and overlap degree (secondary).
     4.  **Global Sync**: In a distributed setting, all ranks must agree on the number of stages. The `DistAttnSolver` performs an `all_reduce(MAX)` to synchronize the final `overlap_degree` across the cluster.
 
+## Computation-Communication Overlap
+
+MagiAttention achieves high performance by interleaving communication and computation in a pipelined manner, managed by the `DistAttnRuntime`.
+
+### 1. The Pipeline Structure
+The execution is divided into a **Host Stage** and multiple **Remote Stages**.
+
+*   **Host Stage (Local)**: The GPU immediately starts computing attention for the local Q and K shards (which are already in memory).
+*   **Remote Stages (Pipelined)**: While the Host Stage is running, the system asynchronously fetches the first batch of remote K/V blocks.
+
+### 2. Execution Loop (`DistAttnFunc.forward`)
+The loop inside `DistAttnFunc.forward` orchestrates this pipeline:
+
+1.  **Start Host Computation**: The attention kernel (`_flex_flash_attn_forward`) is launched for the local data.
+2.  **Prefetch Next Stage**: *Simultaneously*, the runtime issues asynchronous `GroupCast` operations to fetch the K/V blocks needed for the *next* stage.
+3.  **Process Remote Stages**: For each subsequent stage `i`:
+    *   **Wait**: The system waits for the data transfer for Stage `i` to complete (using `wait_post_process`).
+    *   **Compute**: It launches the attention kernel for Stage `i`, accumulating results directly into the local output buffer (`out_acc`).
+    *   **Prefetch**: It triggers the data fetch for Stage `i+1`.
+    *   **Reduce**: In parallel, it may launch asynchronous `GroupReduce` operations to merge partial results (if needed).
+
+### 3. Key Optimization Techniques
+*   **Asynchronous I/O**: Operations like `group_cast` and `group_reduce` are non-blocking, allowing the CPU to proceed and launch GPU kernels while data is moving.
+*   **Direct Accumulation**: The Flexible Flash Attention (FFA) kernel supports accumulating results directly into the `out_acc` tensor, avoiding the need to store and manually sum partial intermediate tensors.
+*   **SM Margin**: The kernels are designed to leave a small margin of Streaming Multiprocessors (SMs) free, ensuring that communication kernels (like NCCL operations) don't get starved of resources while a heavy attention computation is running.
+
+## Backward Pass and Gradient Computation
+
+The backward pass mirrors the forward pass's pipelined structure but involves more complex data dependencies and reduction steps.
+
+### 1. Objective
+Compute gradients for `q`, `k`, `v`, and `sink` (`dq`, `dk`, `dv`, `dsink`).
+
+### 2. The Backward Pipeline
+Similar to the forward pass, the backward pass is divided into a **Host Stage** and multiple **Remote Stages**. However, the data flow is different:
+
+*   **Host Stage**:
+    *   Loads saved tensors from the forward pass (`q`, `kv`, `out`, `lse`, `sink`).
+    *   Computes partial gradients using local data.
+    *   Starts pre-fetching remote data for the first remote stage.
+
+*   **Remote Stages**:
+    *   **Data Fetching**: The backward pass requires fetching not just `k` and `v`, but also `q`, `out`, `do` (gradient of output), and `lse` from remote ranks.
+    *   **Computation**: `apply_bwd_partial_attn` calculates partial gradients for the current stage. `dq` gradients are often accumulated directly into a local buffer.
+    *   **Reduction**:
+        *   `dq` is accumulated locally.
+        *   `dk` and `dv` are partial results that must be summed across ranks. The system uses asynchronous `GroupReduce` to merge these partial gradients.
+        *   `dsink` is synchronized using `all_reduce`.
+
+### 3. Synchronization
+The system uses `prepare_reduced_local_dqkv_global_dsink` as the final synchronization point. It waits for all asynchronous `GroupReduce` and `all_reduce` operations to complete before returning the final gradients, ensuring correctness while maximizing overlap during the computation phase.
+
 ---
 
 ## Internal Calling Process
