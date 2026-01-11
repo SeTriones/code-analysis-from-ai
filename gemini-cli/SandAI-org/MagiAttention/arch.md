@@ -225,6 +225,43 @@ Similar to the forward pass, the backward pass is divided into a **Host Stage** 
 ### 3. Synchronization
 The system uses `prepare_reduced_local_dqkv_global_dsink` as the final synchronization point. It waits for all asynchronous `GroupReduce` and `all_reduce` operations to complete before returning the final gradients, ensuring correctness while maximizing overlap during the computation phase.
 
+## The GroupCast Primitive
+
+`GroupCast` is a novel communication primitive designed by MagiAttention to handle the specific data movement requirements of distributed attention: sparse, non-uniform, and one-to-many "casting" of K/V blocks.
+
+### 1. Mechanism
+Unlike standard collectives, `GroupCast` is driven by a precise "Transfer Table" that defines fine-grained data routing.
+
+*   **Input**: A local tensor partitioned into logical `input_split_sizes`.
+*   **Routing**: `dst_indices` is a 2D list where `dst_indices[i]` contains *all* destination ranks for the `i`-th split. This natively supports **one-to-many casting** (multicast), where a single data block is sent to multiple consumers.
+*   **Output**: The primitive assembles the received data into a contiguous output buffer, respecting the source order defined by `src_index`.
+
+### 2. Implementation Variants
+MagiAttention provides two implementations to balance compatibility and performance:
+
+*   **All-to-All-v Based (`a2av_group_cast_impl`)**:
+    *   **Logic**: Uses the standard `torch.distributed.all_to_all_single`. To handle multicast, it explicitly **replicates** the data in the send buffer for each destination rank.
+    *   **Pros**: Compatible with any backend that supports All-to-All-v (e.g., standard NCCL).
+    *   **Cons**: Data replication increases memory usage and potentially bandwidth consumption.
+
+*   **Native Kernel Based (`native_group_cast_impl`)**:
+    *   **Logic**: Uses custom CUDA kernels to perform direct transfers.
+    *   **Intranode**: Leverages NVLink for high-bandwidth, direct GPU-to-GPU copies without staging buffers.
+    *   **Internode**: Optimizes RDMA transfers by combining them with efficient intranode routing.
+    *   **Multicast**: Efficiently handles one-to-many transfers without explicit data replication in memory.
+
+### 3. Advantages over Standard Primitives
+
+| Feature | Point-to-Point (P2P) | All-to-All | GroupCast |
+| :--- | :--- | :--- | :--- |
+| **Communication Pattern** | 1-to-1 | N-to-N (Dense) | **1-to-N (Sparse & Multicast)** |
+| **Overhead** | High (Many kernel launches) | Low (Single kernel) | **Low (Single kernel)** |
+| **Data Size** | Arbitrary | Uniform (usually) | **Non-Uniform & Irregular** |
+| **Multicast Support** | Manual (Multiple Sends) | No | **Native** |
+
+*   **Vs. P2P**: P2P (send/recv) suffers from high latency and overhead when many small blocks need to be transferred to many different peers. `GroupCast` batches these into a single operation.
+*   **Vs. All-to-All**: Standard All-to-All assumes every rank sends data to every other rank. `GroupCast` is optimized for **sparsity** (only communicating between relevant pairs defined by the Transfer Table) and **multicast** (sending the same data to multiple ranks efficiently).
+
 ---
 
 ## Internal Calling Process
