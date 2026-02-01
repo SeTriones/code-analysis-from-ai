@@ -401,3 +401,57 @@ Dequantization occurs **dynamically during the forward pass** inside specialized
 It is important to distinguish between **repacking** and **dequantization**:
 *   **Repacking**: A one-time conversion (Python/CUDA) that changes the *layout* of quantized bits for better kernel performance. This happens at load time.
 *   **Dequantization**: The conversion from *integer* to *float* for math operations. This happens at inference time.
+
+
+# MoE Layer Architecture Analysis
+
+The `sglang/srt/layers/moe` directory contains the implementation of Mixture-of-Experts (MoE) layers, modularized by backend (Triton, Cutlass, FlashInfer) and functional role.
+
+## Directory Structure
+
+### Root Files
+*   **`router.py`**: Implements the MoE router logic (gate logits).
+*   **`topk.py`**: Logic for selecting top-k experts (standard and grouped).
+*   **`fused_moe_native.py`**: Native PyTorch implementation (fallback).
+*   **`cutlass_moe.py` / `cutlass_w4a8_moe.py`**: Interface for high-performance CUTLASS-based kernels.
+*   **`flashinfer_cutedsl_moe.py`**: Integration with FlashInfer kernels.
+*   **`rocm_moe_utils.py`**: Utilities for AMD GPU compatibility.
+
+### Subdirectories
+*   **`moe_runner/`**: Manages execution orchestration. `runner.py` selects the backend (Triton, DeepGemm, etc.) based on hardware and config.
+*   **`token_dispatcher/`**: Handles data movement. `standard.py` handles local reordering, while `deepep.py` handles Expert Parallelism (all-to-all).
+*   **`fused_moe_triton/`**: Core high-performance implementation using OpenAI Triton. Contains the high-level Python interface and the actual `@triton.jit` kernels.
+*   **`ep_moe/`**: Logic specific to distributed MoE (Expert Parallelism).
+
+---
+
+## Function Calling Stack: DeepSeek V3 MoE Forward (Triton)
+
+Detailed execution flow from model forward to GPU kernel:
+
+1.  **`DeepseekV2Model.forward`** (`sglang/srt/models/deepseek_v2.py`)
+    *   Iterates through layers, calling the decoder layer.
+2.  **`DeepseekV2DecoderLayer.forward`**
+    *   Invokes `self.mlp(hidden_states)` which is an instance of `DeepseekV2MoE`.
+3.  **`DeepseekV2MoE.forward`**
+    *   **Shared Path**: Executes `self.shared_experts` (standard MLP).
+    *   **Routed Path**:
+        *   `router_logits = self.gate(hidden_states)`
+        *   `topk_output = self.topk(hidden_states, router_logits)`
+        *   `final_hidden_states = self.experts(hidden_states, topk_output)`
+    *   **Merge**: Adds results together.
+4.  **`FusedMoE.forward`** (`sglang/srt/layers/moe/fused_moe_triton/layer.py`)
+    *   Calls `self.dispatcher.dispatch(...)` to prepare expert-token mapping.
+    *   Calls `self.run_moe_core(...)`.
+5.  **`FusedMoE.run_moe_core`**
+    *   Calls `self.quant_method.apply(...)` (e.g., `UnquantizedFusedMoEMethod`).
+6.  **`MoeRunner.run`** (`sglang/srt/layers/moe/moe_runner/runner.py`)
+    *   Invokes the registered fused function: `fused_experts_none_to_triton`.
+7.  **`fused_experts` -> `fused_experts_impl`** (`sglang/srt/layers/moe/fused_moe_triton/fused_moe.py`)
+    *   Calculates kernel config via `try_get_optimal_moe_config`.
+    *   Launches Gate/Up kernel: `invoke_fused_moe_kernel(...)`.
+    *   Applies activation: `silu_and_mul` (fused or standalone).
+    *   Launches Down kernel: `invoke_fused_moe_kernel(...)`.
+    *   Sums expert outputs per token: `moe_sum_reduce_triton`.
+8.  **`invoke_fused_moe_kernel`** (`sglang/srt/layers/moe/fused_moe_triton/fused_moe_triton_kernels.py`)
+    *   The final JIT call to the Triton GPU kernel `fused_moe_kernel`.
