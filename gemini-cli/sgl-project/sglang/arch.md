@@ -2,6 +2,8 @@
 
 This document details the Mixture-of-Experts (MoE) runner modes supported in SGLang and their application scenarios.
 
+Based on SGLang version v0.5.4-post3.
+
 ## Supported MoE Runner Modes
 
 SGLang supports **9 modes** (backends) for the MoE runner, defined in `MoeRunnerBackend`:
