@@ -344,3 +344,60 @@ SGLang supports a variety of KV cache types, optimized for different backends an
     *   **Function `alloc_decode` (in `PagedTokenToKVPoolAllocator`, `python/sglang/srt/mem_cache/allocator.py`):** Uses a Triton kernel `alloc_decode_kernel` to allocate the next token slot.
 *   **Important Data Structures:**
     *   `free_pages` (`python/sglang/srt/mem_cache/allocator.py`): List of available page indices.
+
+
+## Model Loading Function Calling Stack for Quantized Models
+
+The process primarily resides in the `sglang.srt.model_loader.loader` module.
+
+1.  **`DefaultModelLoader.load_model(...)`**
+    *   **Entry Point**: Serves as the main entrance for the model loading process.
+    *   **Responsibility**: Determines the target device, prepares weight file lists, and orchestrates the model initialization.
+
+2.  **`_initialize_model(model_config, load_config)`**
+    *   **Instantiation**: Creates an "empty" model architecture (typically on a CPU or Meta device to save GPU memory initially).
+    *   **Quantization Config**: Calls `_get_quantization_config(...)` to identify the specific quantization method (e.g., GPTQ, AWQ, FP8) from the model's configuration.
+    *   **Model Class**: Uses `get_model_architecture(...)` to find the correct Python class for the model (e.g., `LlamaForCausalLM`).
+    *   **Execution**: Returns an instance via `model = ModelClass(config, quant_config=quant_config, ...)`.
+
+3.  **Model Layer Initialization (`LlamaForCausalLM.__init__`)**
+    *   **Hierarchy**: The `quant_config` is propagated from the top-level model class down through the sub-modules: `Model` -> `DecoderLayer` -> `Attention` / `MLP` -> `Linear` layers.
+    *   **Specialized Layers**: Linear layers like `RowParallelLinear` and `QKVParallelLinear` receive the `quant_config`.
+
+4.  **Layer-Specific Setup (`RowParallelLinear.__init__`)**
+    *   **Quant Method**: The layer calls `self.quant_method = quant_config.get_quant_method(self, ...)` to get a specific logic handler (e.g., `GPTQLinearMethod`).
+    *   **Weight Creation**: `self.quant_method.create_weights(layer, ...)` is called.
+    *   **Parameter Registration**: Instead of registering a standard `.weight`, the quantization method registers quantized parameters such as `qweight`, `qzeros`, and `scales`.
+    *   **Loader Assignment**: A custom `weight_loader` function is attached to these parameters to handle the specific mapping from checkpoint tensors.
+
+5.  **`DefaultModelLoader.load_weights_and_postprocess(...)`**
+    *   **Data Injection**: Triggers the actual loading of tensors from files (e.g., Safetensors).
+    *   **Iterator**: Iterates over weights using `model.load_weights(self._get_all_weights(...))`.
+    *   **Mapping**: For each weight found on disk, the model locates the corresponding registered parameter and calls its `weight_loader`.
+    *   **Copy**: The raw quantized data (often packed `int32` tensors representing `int4` or `int8` values) is copied into GPU memory.
+
+6.  **`quant_method.process_weights_after_loading(module)`**
+    *   **Finalization**: Executed after all weights are loaded but before inference begins.
+    *   **Repacking**: Methods like Marlin or certain FP8 implementations may perform a bit-shuffling or repacking step to optimize the memory layout for high-performance CUDA kernels.
+
+---
+
+## Dequantization Strategy
+
+In SGLang, **dequantization generally does not happen during the loading phase.** Weights remain in their quantized form in GPU memory to save space and bandwidth.
+
+### On-the-Fly Dequantization
+Dequantization occurs **dynamically during the forward pass** inside specialized CUDA/Triton kernels:
+
+*   **Execution**: When a linear layer's `apply` method is called, it invokes a kernel (e.g., `gptq_gemm` or `fused_marlin_moe`).
+*   **Kernel Logic**:
+    1.  The kernel loads the packed integer weights from VRAM.
+    2.  It performs bit-shifting and masking to unpack the values (e.g., extracting two 4-bit weights from one 8-bit byte).
+    3.  It applies scales and zero-points to convert the integers back to floating-point (FP16/BF16) in registers or shared memory.
+    4.  The matrix multiplication is performed using these temporary floating-point values.
+    5.  The final result is returned as a standard floating-point tensor.
+
+### Repacking vs. Dequantization
+It is important to distinguish between **repacking** and **dequantization**:
+*   **Repacking**: A one-time conversion (Python/CUDA) that changes the *layout* of quantized bits for better kernel performance. This happens at load time.
+*   **Dequantization**: The conversion from *integer* to *float* for math operations. This happens at inference time.
