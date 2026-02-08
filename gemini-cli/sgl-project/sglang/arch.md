@@ -457,3 +457,31 @@ Detailed execution flow from model forward to GPU kernel:
     *   Sums expert outputs per token: `moe_sum_reduce_triton`.
 8.  **`invoke_fused_moe_kernel`** (`sglang/srt/layers/moe/fused_moe_triton/fused_moe_triton_kernels.py`)
     *   The final JIT call to the Triton GPU kernel `fused_moe_kernel`.
+
+# Paged KV Cache Memory Management
+
+SGLang uses a two-level memory management system for its Paged KV Cache, consisting of the `req_to_token_pool` and the `token_to_kv_pool_allocator`.
+
+## 1. `token_to_kv_pool_allocator` (Physical Memory Allocator)
+- **Role:** Acts as the **Physical Space Manager**. It owns the actual GPU memory buffers where KV cache data is stored.
+- **Functionality:**
+    - Treats GPU memory as a collection of fixed-size **pages** (or blocks).
+    - Handles the low-level **allocation** and **deallocation** of physical page indices.
+    - Provides the base pointers to the physical K and V buffers on the GPU.
+- **Analogy:** The **Landlord** of a storage facility who knows which lockers are empty and hands out keys.
+
+## 2. `req_to_token_pool` (Logical-to-Physical Mapping)
+- **Role:** Acts as the **Directory / Page Table**. It maintains the mapping between a logical request and its assigned physical pages.
+- **Functionality:**
+    - Stores a mapping table (typically a 2D tensor) of `Request_ID -> [Physical_Page_Indices]`.
+    - During inference, the attention kernels use this pool to resolve which physical memory addresses to read from or write to for a specific token in a request.
+- **Analogy:** The **Front Desk Directory** that tells you which specific lockers (physical indices) belong to a particular customer (request).
+
+## Summary Comparison
+
+| Feature | `token_to_kv_pool_allocator` | `req_to_token_pool` |
+| :--- | :--- | :--- |
+| **Primary Responsibility** | Manage physical GPU memory blocks. | Manage logical mapping for requests. |
+| **Key Information** | Free vs. Used physical pages. | Request ID to Page ID mapping. |
+| **Output** | Physical Page ID (e.g., `42`). | List of Page IDs for a request. |
+| **Main Consumer** | The **Scheduler** (for memory planning). | The **Model Kernels** (for data access). |
